@@ -4,9 +4,14 @@ uSpherum ESC Console Client
 Usage:
     cli.py config list
     cli.py config set <config_name> <value>
-    cli.py ll list
+    cli.py ll list [--sort=<sort by>] [--filter=<filter>] [--group=<group>]
+    cli.py ll status [--sort=<sort by>] [--filter=<filter>] [--group=<group>]
     cli.py ll show <id>
     cli.py ll add <name> [--lat <lat>] [--lng <lng>]
+    cli.py ll cmd (--relay=<relay> | --mode=<mode>)
+    cli.py llgr list
+    cli.py (--interactive|-i)
+    cli.py show <show>
 
 Options:
     -h --help   Show this help screen
@@ -17,13 +22,18 @@ from json import load, dump
 from uuid import UUID
 import pkg_resources
 import pickle
+from functools import partial
+from typing import Sequence
 from os.path import dirname, join, exists
 from collections import OrderedDict, abc
+from concurrent.futures import ThreadPoolExecutor
+from asyncio import get_event_loop
 from urllib.parse import urljoin
 from pprint import pprint
 from jsonschema import validate
-from docopt import docopt
+from docopt import docopt, DocoptExit, printable_usage
 from tabulate import tabulate
+import websockets
 import requests
 
 
@@ -90,7 +100,7 @@ class Config:
 
         validate(cfg, cls.config_schema)
         with open(cls.config_path, 'w') as f:
-            dump(cfg, f)
+            dump(cfg, f, indent=4)
 
 
 class Cache:
@@ -106,8 +116,8 @@ class Cache:
         return cache
 
     @classmethod
-    def get(cls, key):
-        return cls._current_cache().get(key)
+    def get(cls, key, default=None):
+        return cls._current_cache().get(key, default)
 
     @classmethod
     def set(cls, key, value):
@@ -155,16 +165,142 @@ def _get_lines():
     return lines
 
 
+def _get_lines_status():
+    url = urljoin(Config.get('api.url'), 'api/v1/lighting-line-state')
+    token = Config.get('api.http.auth.token')
+    lines_status = requests.get(
+        url, headers=dict(Authorization=f'Bearer {token}')).json()
+    return lines_status
+
+
+def _get_line_groups():
+    url = urljoin(Config.get('api.url'), 'api/v1/lighting-line-group')
+    token = Config.get('api.http.auth.token')
+    groups = requests.get(
+        url, headers=dict(Authorization=f'Bearer {token}')).json()
+    return groups
+
+
+def apply_line_filters_and_sorting(lines, sort_by, group_id, req_filter):
+
+    def ll_filter(line):
+        return True
+
+    if req_filter is not None:
+        field_name, filter_expr = req_filter.split(':')
+        if field_name in ('id', 'name'):
+            def ll_filter(line):
+                return line[field_name].find(filter_expr) != -1
+
+        if field_name == 'm' and filter_expr.lower() in ('t', 'f'):
+            def ll_filter(line):
+                return line['in_maintenance'] == (filter_expr.lower() == 't')
+
+    def ll_group_filter(f):
+        def _filter(line):
+            if group_id is not None:
+                return f(line) and int(group_id) in line['groups']
+            return f(line)
+        return _filter
+
+    ll_filter = ll_group_filter(ll_filter)
+
+    lines = sorted(
+        lines,
+        key=lambda l: UUID(l[sort_by]) if sort_by == 'id' else sort_by)
+
+    return [l for l in lines if ll_filter(l)]
+
+
 def ll_list(args):
     lines = _get_lines()
-    if isinstance(lines, (tuple, list)):
-        lines = sorted(lines, key=lambda l: UUID(l['id']))
-        Cache.set('ll', lines)
+    sort_by = args['--sort'] or 'id'
+    group_id = args['--group']
+    required_filter = args['--filter']
 
-        print(tabulate([list(l.values()) for l in lines],
-                       headers=['Id', 'Name', 'Lat', 'Lng']))
+    if isinstance(lines, (tuple, list)):
+        Cache.set('ll', lines)
+        lines = apply_line_filters_and_sorting(
+            lines, sort_by, group_id, required_filter)
+
+        Cache.set('last_choosed_ll', lines)
+
+        tab = tabulate([list(l.values()) for l in lines],
+                       headers=['Id', 'Name', 'Lat', 'Lng',
+                                'In maintenance', 'Groups'])
+        Cache.set('last_showed_ll', tab)
+        Cache.set('last_showed', tab)
+        print(tab)
     else:
         print(lines)
+
+
+def ll_status(args):
+    lines = Cache.get('ll')
+    if lines is None:
+        lines = _get_lines()
+
+    lines_status = _get_lines_status()
+    lines_status_by_id = {l_st['line_id']: l_st for l_st in lines_status}
+
+    sort_by = args['--sort'] or 'id'
+    group_id = args['--group']
+    required_filter = args['--filter']
+
+    if isinstance(lines_status, (tuple, list)):
+        Cache.set('ll', lines)
+        lines = apply_line_filters_and_sorting(
+            lines, sort_by, group_id, required_filter)
+
+        Cache.set('last_choosed_ll', lines)
+
+        for line in lines:
+            del line['lat']
+            del line['lng']
+            del line['groups']
+
+            line_st = lines_status_by_id.get(line['id'], {})
+            el_params = line_st.get('el_params', {}).get('val', {}) or {}
+            pwr_actv = el_params.get('pwr_actv', ['-'])[0]
+            if isinstance(pwr_actv, float):
+                pwr_actv = round(pwr_actv, 3)
+
+            eap = el_params.get('eap', ['-'])[0]
+            if isinstance(eap, float):
+                eap = round(eap, 3)
+
+            line.update(dict(
+                relay=line_st.get('relay', {}).get('val', '-'),
+                ctl_mode=line_st.get('ctl_mode', {}).get('val', '-'),
+                pwr_actv=pwr_actv, eap=eap))
+
+        tab = tabulate([list(l.values()) for l in lines],
+                       headers=['Id', 'Name', 'In maintenance', 'Relay',
+                                'Ctl. mode', 'Pwr. Active', 'Energy Sum.'])
+        Cache.set('last_showed_ll_st', tab)
+        Cache.set('last_showed', tab)
+        print(tab)
+    else:
+        print(lines_status)
+
+
+def ll_groups_list(args):
+    groups = _get_line_groups()
+
+    if isinstance(groups, (tuple, list)):
+        groups = sorted(groups, key=lambda g: g['group_id'])
+        Cache.set('last_choosed_llgr', groups)
+
+        tab = tabulate([
+            [v for k, v in gr.items() if k != 'lines'] for gr in groups
+        ], headers=['Id', 'Name', 'Child groups'])
+
+        Cache.set('last_showed_llgr', tab)
+        Cache.set('last_showed', tab)
+        print(tab)
+
+    else:
+        print(groups)
 
 
 def ll_show(args):
@@ -181,10 +317,81 @@ def ll_show(args):
         pprint(line)
 
 
+def show_last(args):
+    nothing = 'Nothing to show'
+    if args['<show>'] == '_':
+        print(Cache.get('last_showed', nothing))
+
+    elif args['<show>'] == 'll':
+        print(Cache.get('last_showed_ll', nothing))
+
+    elif args['<show>'] == 'll_st':
+        print(Cache.get('last_showed_ll_st', nothing))
+
+    elif args['<show>'] == 'llgr':
+        print(Cache.get('last_showed_llgr', nothing))
+
+
+async def lines_relay_cmd(lines: Sequence[dict], relay_state: str):
+    assert relay_state.lower() in ('on', 'off')
+
+
+def ll_cmd(args):
+    lines = Cache.get('last_choosed_ll')
+    if lines is None:
+        print('No lines choosed')
+        return
+
+    if args['--relay'] is not None:
+        resp = input(
+            f'Set relay {args["--relay"]} for {len(lines)} lines? [y/N]')
+
+        if resp.lower() == 'y':
+            get_event_loop().run_until_complete(
+                lines_relay_cmd(lines, args['--relay']))
+
+
 def determine_command(commands: OrderedDict, arguments: dict):
     for cmd in commands:
         if all(arguments.get(token, False) for token in cmd.split('.')):
             return commands[cmd]
+
+
+def start_interactive():
+    while True:
+        command = input('> ')
+        if command in ('exit', 'quit', '\q'):
+            return
+
+        try:
+            arguments = docopt(
+                __doc__,
+                argv=command.split(),
+                version=pkg_resources.get_distribution(
+                    'uspherum-esc-cli').version
+            )
+            dispatch_command(arguments, is_interactive=True)
+        except DocoptExit:
+            print(printable_usage(__doc__))
+
+
+def dispatch_command(arguments, is_interactive=False):
+    commands = OrderedDict({
+        'config.list': config_list,
+        'config.set': config_set,
+        'll.list': ll_list,
+        'll.status': ll_status,
+        'll.show': ll_show,
+        'll.cmd': ll_cmd,
+        'llgr.list': ll_groups_list,
+        'show': show_last
+    })
+
+    command = determine_command(commands, arguments)
+    if command is not None:
+        command(arguments)
+    else:
+        print('Unknown command requested!', printable_usage(__doc__))
 
 
 def main():
@@ -193,18 +400,12 @@ def main():
         version=pkg_resources.get_distribution('uspherum-esc-cli').version
     )
 
-    commands = OrderedDict({
-        'config.list': config_list,
-        'config.set': config_set,
-        'll.list': ll_list,
-        'll.show': ll_show
-    })
+    # Интерактивный режим с использование WebSocket
+    if arguments['-i'] or arguments['--interactive']:
+        start_interactive()
+        return
 
-    command = determine_command(commands, arguments)
-    if command is not None:
-        command(arguments)
-    else:
-        print('Unknown command requested!', __doc__)
+    dispatch_command(arguments)
 
 
 if __name__ == '__main__':
