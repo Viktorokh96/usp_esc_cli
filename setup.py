@@ -15,6 +15,7 @@ setup(
         'tabulate>=0.8.6,<1',
         'jsonschema>=3.2.0',
         'docopt>=0.6.2',
+        'websockets>=8.1,<9',
     ],
     extras_require={
         'dev': [

@@ -18,21 +18,23 @@ Options:
     --lat       Object latitude
     --lng       Object longitude
 """
-from json import load, dump
+from json import load, dump, loads, dumps
 from uuid import UUID
 import pkg_resources
 import pickle
-from functools import partial
+import datetime
+from urllib.parse import urlparse
+from random import randint
 from typing import Sequence
 from os.path import dirname, join, exists
 from collections import OrderedDict, abc
-from concurrent.futures import ThreadPoolExecutor
 from asyncio import get_event_loop
 from urllib.parse import urljoin
 from pprint import pprint
 from jsonschema import validate
 from docopt import docopt, DocoptExit, printable_usage
 from tabulate import tabulate
+from websockets.client import Connect
 import websockets
 import requests
 
@@ -44,6 +46,19 @@ def deep_update(d, u):
         else:
             d[k] = v
     return d
+
+
+def utc_dt() -> datetime.datetime:
+    return datetime.datetime.utcnow().astimezone()
+
+
+def utc_ts(mult=1e6) -> int:
+    """Микросекунды"""
+    return int(utc_dt().timestamp()*mult)
+
+
+def sid() -> int:
+    return randint(1, 1 << 128)
 
 
 class Config:
@@ -125,6 +140,11 @@ class Cache:
         current_cache[key] = value
         with open(cls.cache_path, 'wb') as cache_file:
             pickle.dump(current_cache, cache_file)
+
+
+def ws_uri_from_url(url: str) -> str:
+    url = urlparse(url)
+    return dict(https='wss', http='ws')[url.scheme] + '://' + url.netloc
 
 
 def config_list(args):
@@ -332,8 +352,63 @@ def show_last(args):
         print(Cache.get('last_showed_llgr', nothing))
 
 
+async def _auth(ws) -> dict:
+    await ws.send(dumps({
+        "ver": 1,
+        "proto": "authReq",
+        "ts": utc_ts(),
+        "sid": sid(),
+        "authToken": Config.get('api.ws.auth.token')
+    }))
+    return loads(await ws.recv())
+
+
 async def lines_relay_cmd(lines: Sequence[dict], relay_state: str):
-    assert relay_state.lower() in ('on', 'off')
+    relay_state = relay_state.lower()
+    assert relay_state in ('on', 'off')
+
+    uri = f"{ws_uri_from_url(Config.get('api.url'))}/ws"
+    async with websockets.connect(uri) as ws:
+        print(await _auth(ws))
+        await ws.send(dumps({
+            "ver": 1,
+            "proto": "objSendCtlCmdReq",
+            "ts": utc_ts(),
+            "sid": sid(),
+            "cmd": "relayEnable" if relay_state == 'on' else 'relayDisable',
+            "cmdParams": {},
+            "objects": [
+                {
+                    "id": line['id'],
+                    "type": "line",
+                } for line in lines
+            ]
+          }
+        ))
+        print(loads(await ws.recv()))
+
+
+async def lines_mode_cmd(lines: Sequence[dict], mode: str):
+    assert mode in ('auto:sch', 'manual')
+
+    uri = f"{ws_uri_from_url(Config.get('api.url'))}/ws"
+    async with websockets.connect(uri) as ws:
+        print(await _auth(ws))
+        await ws.send(dumps({
+            "ver": 1,
+            "proto": "setCtlModeReq",
+            "ts": utc_ts(),
+            "sid": sid(),
+            "objects": [
+                {
+                    "id": line['id'],
+                    "type": "line",
+                    "mode": mode
+                } for line in lines
+            ]
+          }
+        ))
+        print(loads(await ws.recv()))
 
 
 def ll_cmd(args):
@@ -344,11 +419,19 @@ def ll_cmd(args):
 
     if args['--relay'] is not None:
         resp = input(
-            f'Set relay {args["--relay"]} for {len(lines)} lines? [y/N]')
+            f'Set relay {args["--relay"]} for {len(lines)} lines? [y/N]: ')
 
         if resp.lower() == 'y':
             get_event_loop().run_until_complete(
                 lines_relay_cmd(lines, args['--relay']))
+
+    if args['--mode'] is not None:
+        resp = input(
+            f'Set mode {args["--mode"]} for {len(lines)} lines? [y/N]: ')
+
+        if resp.lower() == 'y':
+            get_event_loop().run_until_complete(
+                lines_mode_cmd(lines, args['--mode']))
 
 
 def determine_command(commands: OrderedDict, arguments: dict):
